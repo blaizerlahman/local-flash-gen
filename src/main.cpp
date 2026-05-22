@@ -235,6 +235,45 @@ int get_props(httplib::Client& client, Config& cfg) {
   return 0;
 }
 
+// returns the token count of the note at filepath, or nullopt on error
+std::optional<int> get_note_token_count(httplib::Client& client, const fs::path& filepath) {
+
+  std::ifstream file(filepath);
+  if (!file) {
+    std::cerr << "error: cannot read file: " << filepath << std::endl;
+    return std::nullopt;
+  }
+
+  // read in whole file content
+  std::ostringstream content;
+  content << file.rdbuf();
+
+  nlohmann::json req_body = { {"content", content.str()} };
+
+  // get file token count
+  if (auto res = client.Post("/tokenize", req_body.dump(), "application/json")) {
+
+    if (res->status == httplib::StatusCode::OK_200) {
+      nlohmann::json res_body;
+      try {
+        res_body = nlohmann::json::parse(res->body);
+      } catch (nlohmann::json::parse_error& e) {
+        std::cerr << "ERROR: JSON parsing of /tokenize response failed: " << e.what() << std::endl;
+        return std::nullopt;
+      }
+
+      return static_cast<int>(res_body["tokens"].size());
+    } else {
+      std::cerr << "STATUS CODE: " << res->status << std::endl;
+      return std::nullopt;
+    }
+  } else {
+    auto err = res.error();
+    std::cerr << "ERROR: " << httplib::to_string(err) << std::endl;
+    return std::nullopt;
+  }
+}
+
 int main(int argc, char* argv[]) {
 
   if (argc == 1) {
@@ -262,6 +301,8 @@ int main(int argc, char* argv[]) {
 
   std::cout << "Model context window: " << cfg.context_window << std::endl;
   std::cout << "System prompt token count: " << cfg.system_prompt_tokens << std::endl;
+
+
 
   return 0;
 }

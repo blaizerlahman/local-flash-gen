@@ -11,12 +11,29 @@
 
 namespace fs = std::filesystem;
 
+std::string SYSTEM_PROMPT{R"(You are a flashcard generator. You receive one or more text/Markdown notes and output Anki-compatible flashcards.
+
+  **INPUT:** text/Markdown note content.
+  **OUTPUT:** Plain text, one card per line, front and back separated by a tab character:
+  Question\tAnswer
+
+  **RULES:**
+  - Extract key facts, definitions, and relationships from the notes.
+  - Write short, specific questions with concise answers. Target a single self-contained fact per card.
+  - Phrase questions so only one answer is correct and unambiguous.
+  - Do not produce cards for trivial information (headings, formatting artifacts, TODOs, etc.).
+  - Do not add commentary, headers, or formatting; output only tab-separated lines.
+
+  )"};
+
 struct Config {
   std::vector<fs::path> input_files;
   fs::path output_file{"anki_cards.txt"};
   std::string prompt_append;
   int chunk_size_notes{1};
   int server_port{8080};
+  int context_window;
+  int system_prompt_tokens;
 };
 
 static void print_usage(const char* prog) {
@@ -40,7 +57,7 @@ static std::string resolve_append(const std::string& value) {
   if (fs::is_regular_file(value, ec)) {
     std::ifstream f(value);
     if (!f) {
-      std::cerr << "error: cannot read -a file: " << value << '\n';
+      std::cerr << "error: cannot read -a file: " << value << std::endl;
       return {};
     }
     std::ostringstream ss;
@@ -117,7 +134,7 @@ static std::optional<Config> parse_args(int argc, char* argv[]) {
         }
       }
     } else {
-      std::cerr << "error: unknown flag: " << flag << '\n';
+      std::cerr << "error: unknown flag: " << flag << std::endl;
       print_usage(argv[0]);
       return std::nullopt;
     }
@@ -131,15 +148,15 @@ static std::optional<Config> parse_args(int argc, char* argv[]) {
   }
 
   // verify that all input files are valid 
-  for (const auto& p : cfg.input_files) {
+  for (const auto& file : cfg.input_files) {
 
     std::error_code ec;
-    if (!fs::exists(p, ec) || !fs::is_regular_file(p, ec)) {
-      std::cerr << "error: input file not found or not a regular file: " << p << '\n';
+    if (!fs::exists(file, ec) || !fs::is_regular_file(file, ec)) {
+      std::cerr << "error: input file not found or not a regular file: " << file << std::endl;
       return std::nullopt;
     }
-    if (std::ifstream f(p); !f) {
-      std::cerr << "error: input file is not readable: " << p << '\n';
+    if (std::ifstream f(file); !f) {
+      std::cerr << "error: input file is not readable: " << file << std::endl;
       return std::nullopt;
     }
   }
@@ -149,13 +166,73 @@ static std::optional<Config> parse_args(int argc, char* argv[]) {
     if (!out_dir.empty()) {
       std::error_code ec;
       if (!fs::is_directory(out_dir, ec)) {
-        std::cerr << "error: output directory does not exist: " << out_dir << '\n';
+        std::cerr << "error: output directory does not exist: " << out_dir << std::endl;
         return std::nullopt;
       }
     }
   }
 
   return cfg;
+}
+
+// fetch model context length and token count of system prompt
+int get_props(httplib::Client& client, Config& cfg) {
+
+  // get context window length of model
+  if (auto res = client.Get("/props")) {
+    if (res->status == httplib::StatusCode::OK_200) {
+      auto metadata = nlohmann::json::parse(res->body);
+      int context = metadata["default_generation_settings"].value("n_ctx", -1);
+      if (context < 0) {
+        std::cerr << "ERROR: context window not found or is set to -1" << std::endl;
+        return 1;
+      }
+
+      cfg.context_window = context;
+
+    } else {
+      std::cerr << "STATUS CODE: " << res->status << std::endl;
+      return 1;
+    }
+  } else {
+    auto err = res.error();
+    std::cerr << "ERROR: " << httplib::to_string(err) << std::endl;
+    return 1;
+  }
+
+  nlohmann::json req_body = { {"content", SYSTEM_PROMPT} };
+
+  // get token count of system prompt
+  if (auto res = client.Post("/tokenize", req_body.dump(), "application/json")) {
+
+    if (res->status == httplib::StatusCode::OK_200) {
+      
+      nlohmann::json res_body;
+      try {
+        res_body = nlohmann::json::parse(res->body);
+      } catch (nlohmann::json::parse_error& e) {
+        std::cerr << "ERROR: JSON parsing of /tokenize response failed" << e.what() << std::endl;
+        return 1;
+      }
+      
+      int tokens = res_body["tokens"].size();
+      if (tokens == 0) {
+        std::cerr << "ERROR: No system prompt or error with /tokenize" << std::endl;
+        return 1;
+      }
+
+      cfg.system_prompt_tokens = tokens;
+    } else {
+      std::cerr << "STATUS CODE: " << res->status << std::endl;
+      return 1;
+    }
+  } else {
+    auto err = res.error();
+    std::cerr << "ERROR: " << httplib::to_string(err) << std::endl;
+    return 1;
+  }
+
+  return 0;
 }
 
 int main(int argc, char* argv[]) {
@@ -165,17 +242,26 @@ int main(int argc, char* argv[]) {
     return 0;
   }
 
-  auto cfg = parse_args(argc, argv);
-  if (!cfg) return 1;
+  auto temp_cfg = parse_args(argc, argv);
+  if (!temp_cfg) return 1;
+
+  Config& cfg = *temp_cfg;
 
   std::cout << "Input files:\n";
-  for (const auto& p : cfg->input_files)
-    std::cout << "  " << p << '\n';
+  for (const auto& p : cfg.input_files)
+    std::cout << "  " << p << std::endl;
 
-  std::cout << "Output file: " << cfg->output_file << '\n';
-  std::cout << "Chunk size: " << cfg->chunk_size_notes << " notes\n";
-  std::cout << "Local server port: " << cfg->server_port << '\n';
+  std::cout << "Output file: " << cfg.output_file << std::endl;
+  std::cout << "Chunk size: " << cfg.chunk_size_notes << " notes\n";
+  std::cout << "Local server port: " << cfg.server_port << std::endl;
 
+  httplib::Client client("localhost", cfg.server_port);
+
+  int err = get_props(client, cfg);
+  if (err) return 1;
+
+  std::cout << "Model context window: " << cfg.context_window << std::endl;
+  std::cout << "System prompt token count: " << cfg.system_prompt_tokens << std::endl;
 
   return 0;
 }

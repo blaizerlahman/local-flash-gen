@@ -15,7 +15,7 @@ std::string SYSTEM_PROMPT = R"(You are a flashcard generator. You receive one or
 
 INPUT: text/Markdown note content.
 
-OUTPUT: A JSON array of objects, each with a "question" and "answer" field. Output only the JSON array and nothing else. No commentary, no markdown code fences, no explanation.
+OUTPUT: A JSON array of objects, each with a "question" and "answer" field. Output only the JSON array and nothing else. No commentary, no markdown code fences, no explanation. Output flashcard question/answer pairs for ALL notes that are provided.
 
 Example output:
 [{"question":"What is mitosis?","answer":"A type of cell division that produces two genetically identical daughter cells."},{"question":"How many phases does mitosis have?","answer":"Four: prophase, metaphase, anaphase, and telophase."}]
@@ -25,6 +25,7 @@ RULES:
 - Write short, specific questions with concise answers. Target a single self-contained fact per card.
 - Phrase questions so only one answer is correct and unambiguous.
 - Do not produce cards for trivial information such as headings, formatting artifacts, or TODOs.
+- You MUST generate flashcards for ALL provided notes. New notes are denoted with 'NEW NOTES:'.
 - Output ONLY the JSON array. No other text.
 
 
@@ -337,13 +338,22 @@ int parse_and_write(nlohmann::json json_body, Config& cfg) {
       content = content.substr(0, closing_fence);
   }
 
-  // parse content as JSON array of flashcards
+  // parse content as JSON array of flashcards, on truncation recover up to the last complete card
   nlohmann::json cards;
   try {
     cards = nlohmann::json::parse(content);
-  } catch (const nlohmann::json::parse_error& e) {
-    std::cerr << "ERROR: Failed to parse flashcard JSON from model output: " << e.what() << std::endl;
-    return 1;
+  } catch (const nlohmann::json::parse_error&) {
+    auto last_close = content.rfind('}');
+    if (last_close == std::string::npos) {
+      std::cerr << "ERROR: Failed to parse flashcard JSON from model output (unrecoverable)" << std::endl;
+      return 1;
+    }
+    try {
+      cards = nlohmann::json::parse(content.substr(0, last_close + 1) + "\n]");
+    } catch (const nlohmann::json::parse_error& e) {
+      std::cerr << "ERROR: Failed to parse flashcard JSON from model output: " << e.what() << std::endl;
+      return 1;
+    }
   }
 
   if (!cards.is_array()) {
